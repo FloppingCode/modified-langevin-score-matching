@@ -90,6 +90,55 @@ def plot_training_curves(history: dict, figsize: tuple = (8, 4)) -> plt.Figure:
     return fig
 
 
+@torch.no_grad()
+def plot_score_comparison(
+    model_a: torch.nn.Module,
+    model_b: torch.nn.Module,
+    sigma: float,
+    label_a: str = "Model A",
+    label_b: str = "Model B",
+    xlim: tuple = (-1.5, 1.5),
+    ylim: tuple = (-1.5, 1.5),
+    grid_size: int = 30,
+    device: str = "cuda",
+    data: Optional[torch.Tensor] = None,
+) -> plt.Figure:
+    """Side-by-side quiver plots comparing two score models at a given sigma."""
+    model_a.eval()
+    model_b.eval()
+
+    xs = np.linspace(xlim[0], xlim[1], grid_size)
+    ys = np.linspace(ylim[0], ylim[1], grid_size)
+    xx, yy = np.meshgrid(xs, ys)
+    grid = np.stack([xx.ravel(), yy.ravel()], axis=-1)
+
+    grid_t = torch.tensor(grid, dtype=torch.float32, device=device)
+    sigma_t = torch.full((grid_t.shape[0], 1), sigma, device=device)
+
+    scores_a = model_a(grid_t, sigma_t).cpu().numpy()
+    scores_b = model_b(grid_t, sigma_t).cpu().numpy()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    for ax, scores, label in [(ax1, scores_a, label_a), (ax2, scores_b, label_b)]:
+        u = scores[:, 0].reshape(grid_size, grid_size)
+        v = scores[:, 1].reshape(grid_size, grid_size)
+        mag = np.sqrt(u**2 + v**2)
+
+        if data is not None:
+            data_np = data.detach().cpu().numpy()
+            ax.scatter(data_np[:, 0], data_np[:, 1], s=1, alpha=0.2, color="gray", zorder=0)
+
+        ax.quiver(xx, yy, u, v, mag, cmap="viridis", alpha=0.8)
+        ax.set_title(f"{label} (σ={sigma:.4f})")
+        ax.set_aspect("equal")
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
+    fig.tight_layout()
+    return fig
+
+
 def plot_sampling_trajectory(
     trajectories: torch.Tensor,
     real_data: Optional[torch.Tensor] = None,

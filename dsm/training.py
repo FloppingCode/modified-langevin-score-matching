@@ -7,6 +7,7 @@ def dsm_loss(
     model: nn.Module,
     x: torch.Tensor,
     noise_schedule,
+    sigma_weighting: bool = False,
 ) -> torch.Tensor:
     """Denoising Score Matching loss.
 
@@ -16,10 +17,14 @@ def dsm_loss(
     4. target = -epsilon / sigma
     5. Loss = ||s_theta(x_tilde, sigma) - target||^2
 
+    When sigma_weighting=True, each sample's loss is multiplied by sigma^2.
+    This equalizes contributions across noise levels (Song & Ermon 2019).
+
     Args:
         model: Score network s_theta(x, sigma).
         x: (batch, dim) clean data.
         noise_schedule: GeometricNoiseSchedule instance.
+        sigma_weighting: If True, weight loss by sigma^2.
 
     Returns:
         Scalar loss (mean over batch).
@@ -29,8 +34,12 @@ def dsm_loss(
     x_tilde = x + sigma * epsilon
     target = -epsilon / sigma
     score_pred = model(x_tilde, sigma)
-    loss = ((score_pred - target) ** 2).sum(dim=-1).mean()
-    return loss
+    per_sample = ((score_pred - target) ** 2).sum(dim=-1)  # (batch,)
+
+    if sigma_weighting:
+        per_sample = sigma.squeeze(-1) ** 2 * per_sample
+
+    return per_sample.mean()
 
 
 def train(
@@ -41,6 +50,7 @@ def train(
     lr: float = 1e-3,
     device: str = "cuda",
     log_every: int = 20,
+    sigma_weighting: bool = False,
 ) -> Dict[str, List[float]]:
     """Train the score network with DSM.
 
@@ -54,6 +64,7 @@ def train(
         lr: Initial learning rate.
         device: "cuda" or "cpu".
         log_every: Print loss every N epochs.
+        sigma_weighting: If True, weight DSM loss by sigma^2.
 
     Returns:
         Dictionary with key "loss" mapping to list of per-epoch losses.
@@ -70,7 +81,7 @@ def train(
 
         for (batch_x,) in dataloader:
             batch_x = batch_x.to(device)
-            loss = dsm_loss(model, batch_x, noise_schedule)
+            loss = dsm_loss(model, batch_x, noise_schedule, sigma_weighting=sigma_weighting)
 
             optimizer.zero_grad()
             loss.backward()
