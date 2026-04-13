@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from typing import Optional
 
 
@@ -33,51 +34,6 @@ def plot_samples(
     return fig
 
 
-@torch.no_grad()
-def plot_score_field(
-    model: torch.nn.Module,
-    sigma: float,
-    xlim: tuple = (-1.5, 1.5),
-    ylim: tuple = (-1.5, 1.5),
-    grid_size: int = 30,
-    device: str = "cuda",
-    data: Optional[torch.Tensor] = None,
-) -> plt.Figure:
-    """Quiver plot of the learned score field at a given noise level.
-
-    This is the primary diagnostic for DSM on 2D data — arrows should
-    point toward high-density regions.
-    """
-    model.eval()
-    xs = np.linspace(xlim[0], xlim[1], grid_size)
-    ys = np.linspace(ylim[0], ylim[1], grid_size)
-    xx, yy = np.meshgrid(xs, ys)
-    grid = np.stack([xx.ravel(), yy.ravel()], axis=-1)
-
-    grid_t = torch.tensor(grid, dtype=torch.float32, device=device)
-    sigma_t = torch.full((grid_t.shape[0], 1), sigma, device=device)
-
-    scores = model(grid_t, sigma_t).cpu().numpy()
-    u = scores[:, 0].reshape(grid_size, grid_size)
-    v = scores[:, 1].reshape(grid_size, grid_size)
-
-    fig, ax = plt.subplots(1, 1, figsize=(7, 7))
-
-    if data is not None:
-        data_np = data.detach().cpu().numpy()
-        ax.scatter(data_np[:, 0], data_np[:, 1], s=1, alpha=0.2, color="gray", zorder=0)
-
-    # Color arrows by magnitude
-    magnitude = np.sqrt(u**2 + v**2)
-    ax.quiver(xx, yy, u, v, magnitude, cmap="viridis", alpha=0.8, scale=None)
-    ax.set_title(f"Score field at σ = {sigma:.4f}")
-    ax.set_aspect("equal")
-    ax.set_xlim(xlim)
-    ax.set_ylim(ylim)
-    fig.tight_layout()
-    return fig
-
-
 def plot_training_curves(history: dict, figsize: tuple = (8, 4)) -> plt.Figure:
     """Plot loss vs epoch."""
     fig, ax = plt.subplots(1, 1, figsize=figsize)
@@ -90,87 +46,99 @@ def plot_training_curves(history: dict, figsize: tuple = (8, 4)) -> plt.Figure:
     return fig
 
 
-@torch.no_grad()
-def plot_score_comparison(
-    model_a: torch.nn.Module,
-    model_b: torch.nn.Module,
-    sigma: float,
-    label_a: str = "Model A",
-    label_b: str = "Model B",
-    xlim: tuple = (-1.5, 1.5),
-    ylim: tuple = (-1.5, 1.5),
-    grid_size: int = 30,
-    device: str = "cuda",
-    data: Optional[torch.Tensor] = None,
-) -> plt.Figure:
-    """Side-by-side quiver plots comparing two score models at a given sigma."""
-    model_a.eval()
-    model_b.eval()
-
-    xs = np.linspace(xlim[0], xlim[1], grid_size)
-    ys = np.linspace(ylim[0], ylim[1], grid_size)
-    xx, yy = np.meshgrid(xs, ys)
-    grid = np.stack([xx.ravel(), yy.ravel()], axis=-1)
-
-    grid_t = torch.tensor(grid, dtype=torch.float32, device=device)
-    sigma_t = torch.full((grid_t.shape[0], 1), sigma, device=device)
-
-    scores_a = model_a(grid_t, sigma_t).cpu().numpy()
-    scores_b = model_b(grid_t, sigma_t).cpu().numpy()
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-
-    for ax, scores, label in [(ax1, scores_a, label_a), (ax2, scores_b, label_b)]:
-        u = scores[:, 0].reshape(grid_size, grid_size)
-        v = scores[:, 1].reshape(grid_size, grid_size)
-        mag = np.sqrt(u**2 + v**2)
-
-        if data is not None:
-            data_np = data.detach().cpu().numpy()
-            ax.scatter(data_np[:, 0], data_np[:, 1], s=1, alpha=0.2, color="gray", zorder=0)
-
-        ax.quiver(xx, yy, u, v, mag, cmap="viridis", alpha=0.8)
-        ax.set_title(f"{label} (σ={sigma:.4f})")
-        ax.set_aspect("equal")
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
-
-    fig.tight_layout()
-    return fig
-
-
-def plot_sampling_trajectory(
+def animate_sampling(
     trajectories: torch.Tensor,
     real_data: Optional[torch.Tensor] = None,
-    n_traces: int = 50,
+    n_particles: int = 200,
+    interval: int = 50,
+    xlim: tuple = (-1.5, 1.5),
+    ylim: tuple = (-1.5, 1.5),
     figsize: tuple = (7, 7),
-) -> plt.Figure:
-    """Plot the path of sampled points through the denoising process.
+    title: str = "Sampling Process",
+    trail_length: int = 10,
+    save_path: Optional[str] = None,
+) -> FuncAnimation:
+    """Animate particles moving from noise to data distribution.
 
     Args:
-        trajectories: (num_steps, n_samples, 2) from annealed_langevin_dynamics.
-        real_data: Optional real data to overlay.
-        n_traces: Number of particle traces to draw.
-    """
-    traj_np = trajectories.numpy()
-    n_steps, n_samples, _ = traj_np.shape
-    indices = np.random.choice(n_samples, size=min(n_traces, n_samples), replace=False)
+        trajectories: (n_frames, n_samples, 2) from any sampler.
+        real_data: Optional target data to show as gray background.
+        n_particles: Number of particles to animate (subsampled).
+        interval: Milliseconds between frames.
+        trail_length: Number of past positions to show as fading trail.
+        save_path: If given, save as .gif.
 
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    Returns:
+        FuncAnimation. Display in Colab with:
+            from IPython.display import HTML
+            HTML(anim.to_html5_video())
+    """
+    traj_np = trajectories.detach().cpu().numpy()
+    n_frames, n_samples, _ = traj_np.shape
+    indices = np.random.choice(
+        n_samples, size=min(n_particles, n_samples), replace=False
+    )
+    traj_sub = traj_np[:, indices, :]  # (n_frames, n_particles, 2)
+
+    fig, ax = plt.subplots(figsize=figsize)
 
     if real_data is not None:
         data_np = real_data.detach().cpu().numpy()
-        ax.scatter(data_np[:, 0], data_np[:, 1], s=1, alpha=0.1, color="gray", zorder=0)
+        ax.scatter(
+            data_np[:, 0], data_np[:, 1],
+            s=1, alpha=0.15, color="gray", zorder=0,
+        )
 
-    for idx in indices:
-        trace = traj_np[:, idx, :]
-        # Color from light to dark as sampling progresses
-        ax.plot(trace[:, 0], trace[:, 1], alpha=0.3, linewidth=0.5, color="C0")
-        ax.scatter(trace[-1, 0], trace[-1, 1], s=10, color="C1", zorder=5)
-
-    ax.set_title("Sampling Trajectories")
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
     ax.set_aspect("equal")
-    ax.set_xlim(-1.5, 1.5)
-    ax.set_ylim(-1.5, 1.5)
-    fig.tight_layout()
-    return fig
+    txt = ax.set_title(f"{title} — frame 0/{n_frames}")
+
+    # Current particle positions
+    scat = ax.scatter(
+        traj_sub[0, :, 0], traj_sub[0, :, 1],
+        s=8, color="C0", alpha=0.7, zorder=5,
+    )
+
+    # Trail lines (one per particle)
+    trail_lines = []
+    for _ in range(len(indices)):
+        (line,) = ax.plot([], [], color="C0", alpha=0.15, linewidth=0.5, zorder=2)
+        trail_lines.append(line)
+
+    def update(frame):
+        # Update scatter positions
+        scat.set_offsets(traj_sub[frame])
+
+        # Update trails
+        if trail_length > 0:
+            start = max(0, frame - trail_length)
+            for i, line in enumerate(trail_lines):
+                line.set_data(
+                    traj_sub[start : frame + 1, i, 0],
+                    traj_sub[start : frame + 1, i, 1],
+                )
+
+        txt.set_text(f"{title} — frame {frame}/{n_frames}")
+        return (scat, txt, *trail_lines)
+
+    anim = FuncAnimation(
+        fig, update, frames=n_frames, interval=interval, blit=True,
+    )
+
+    if save_path:
+        from matplotlib.animation import PillowWriter
+        anim.save(save_path, writer=PillowWriter(fps=max(1, 1000 // interval)))
+        print(f"Animation saved to {save_path}")
+
+    plt.close(fig)
+    return anim
+
+
+def display_animation(anim):
+    """Display animation in Jupyter/Colab. Returns HTML object."""
+    from IPython.display import HTML
+    try:
+        return HTML(anim.to_html5_video())
+    except Exception:
+        return HTML(anim.to_jshtml())

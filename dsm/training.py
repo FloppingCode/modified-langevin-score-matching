@@ -1,74 +1,33 @@
 import torch
 import torch.nn as nn
 from typing import Dict, List
-
-
-def dsm_loss(
-    model: nn.Module,
-    x: torch.Tensor,
-    noise_schedule,
-    sigma_weighting: bool = False,
-) -> torch.Tensor:
-    """Denoising Score Matching loss.
-
-    1. Sample sigma ~ Uniform({sigma_1, ..., sigma_L}) per item
-    2. Sample epsilon ~ N(0, I)
-    3. x_tilde = x + sigma * epsilon
-    4. target = -epsilon / sigma
-    5. Loss = ||s_theta(x_tilde, sigma) - target||^2
-
-    When sigma_weighting=True, each sample's loss is multiplied by sigma^2.
-    This equalizes contributions across noise levels (Song & Ermon 2019).
-
-    Args:
-        model: Score network s_theta(x, sigma).
-        x: (batch, dim) clean data.
-        noise_schedule: GeometricNoiseSchedule instance.
-        sigma_weighting: If True, weight loss by sigma^2.
-
-    Returns:
-        Scalar loss (mean over batch).
-    """
-    sigma = noise_schedule.sample_sigma(x.shape[0]).to(x.device)  # (batch, 1)
-    epsilon = torch.randn_like(x)  # (batch, dim)
-    x_tilde = x + sigma * epsilon
-    target = -epsilon / sigma
-    score_pred = model(x_tilde, sigma)
-    per_sample = ((score_pred - target) ** 2).sum(dim=-1)  # (batch,)
-
-    if sigma_weighting:
-        per_sample = sigma.squeeze(-1) ** 2 * per_sample
-
-    return per_sample.mean()
+from .losses import dsm_loss
 
 
 def train(
     model: nn.Module,
     dataloader,
-    noise_schedule,
+    noise_schedule=None,
+    loss_fn=None,
     n_epochs: int = 200,
     lr: float = 1e-3,
     device: str = "cuda",
     log_every: int = 20,
     sigma_weighting: bool = False,
 ) -> Dict[str, List[float]]:
-    """Train the score network with DSM.
+    """Train a score network.
 
     Uses Adam + cosine annealing LR + gradient clipping.
 
-    Args:
-        model: ScoreNetwork instance.
-        dataloader: DataLoader yielding (batch_x,) tuples.
-        noise_schedule: GeometricNoiseSchedule instance.
-        n_epochs: Number of training epochs.
-        lr: Initial learning rate.
-        device: "cuda" or "cpu".
-        log_every: Print loss every N epochs.
-        sigma_weighting: If True, weight DSM loss by sigma^2.
-
-    Returns:
-        Dictionary with key "loss" mapping to list of per-epoch losses.
+    Either provide noise_schedule (uses dsm_loss) or a custom loss_fn
+    that takes (model, batch_x) and returns a scalar loss.
     """
+    if loss_fn is None:
+        assert noise_schedule is not None, "Provide noise_schedule or loss_fn"
+        _loss_fn = lambda m, x: dsm_loss(m, x, noise_schedule, sigma_weighting)
+    else:
+        _loss_fn = loss_fn
+
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
@@ -81,7 +40,7 @@ def train(
 
         for (batch_x,) in dataloader:
             batch_x = batch_x.to(device)
-            loss = dsm_loss(model, batch_x, noise_schedule, sigma_weighting=sigma_weighting)
+            loss = _loss_fn(model, batch_x)
 
             optimizer.zero_grad()
             loss.backward()
